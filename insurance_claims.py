@@ -10,7 +10,7 @@ class Policy:
     policy_id: str
     holder: str
     coverage_type: str
-    coverage_amount: str
+    coverage_amount: u256
     deductible: u256
     start_ts: str
     end_ts: str
@@ -28,9 +28,10 @@ class Claim:
     evidence_urls: str
     status: str
     decision: str
+    coverage_pct: u256
     payout: u256
+    fraud_detected: bool
     ai_reasoning: str
-    fraud_flags: str
     timestamp: str
 
 
@@ -44,7 +45,7 @@ class InsuranceClaims(gl.Contract):
     def __init__(self):
         pass
 
-    def _adjudicate_claim(self, coverage_type: str, coverage_amount: str, deductible: u256, incident_date: str, description: str, evidence_urls: str) -> dict:
+    def _adjudicate_claim(self, coverage_type: str, incident_date: str, description: str, evidence_urls: str) -> dict:
         def gather_and_adjudicate() -> str:
             def fetch(urls_json: str) -> list:
                 texts = []
@@ -59,37 +60,32 @@ class InsuranceClaims(gl.Contract):
             evidence_texts = fetch(evidence_urls)
 
             task = f"""
-You are an insurance claims adjudicator. Verify a claim against policy coverage, check for fraud, and determine payout.
+You are an insurance claims adjudicator. Evaluate a claim against coverage and check for fraud.
 
 COVERAGE TYPE: {coverage_type}
-COVERAGE AMOUNT: {coverage_amount}
-DEDUCTIBLE: {deductible}
-
 INCIDENT DATE: {incident_date}
 INCIDENT DESCRIPTION: {description}
 
 EVIDENCE:
 {chr(10).join(evidence_texts) if evidence_texts else "[none submitted]"}
 
-Evaluate: (1) Is the incident within coverage? (2) Is the claim consistent across evidence? (3) Any fraud indicators? (4) Fair payout after deductible.
-
-Respond ONLY in this JSON format:
+Respond ONLY in this JSON format with these exact fields:
 {{
-    "decision": str,  // "APPROVE", "DENY", or "PARTIAL"
-    "payout": int,  // payout amount (0 if denied)
-    "reasoning": str,
-    "fraud_flags": [str]
+    "decision": "APPROVE" | "DENY" | "PARTIAL",
+    "coverage_percentage": int,  // 0-100, % of coverage paid. 0 if denied, partial between 1-99, full 100
+    "fraud_detected": bool,  // true only if evidence clearly indicates fraud
+    "reasoning": str
 }}
 """
             result = gl.exec_prompt(task).replace("```json", "").replace("```", "")
             return json.dumps(json.loads(result), sort_keys=True)
 
-        principle = "Validators must agree on the core decision (APPROVE/DENY/PARTIAL). Minor differences in payout or fraud flag wording are acceptable if the core outcome matches."
+        principle = "Validators must agree on ALL THREE core outputs: the decision label (APPROVE/DENY/PARTIAL), the exact coverage_percentage (0-100), and the fraud_detected boolean. Reasoning wording may differ."
         result_json = json.loads(gl.eq_principle_prompt_comparative(gather_and_adjudicate, principle))
         return result_json
 
     @gl.public.write
-    def create_policy(self, coverage_type: str, coverage_amount: str, deductible: u256, start_ts: str, end_ts: str):
+    def create_policy(self, coverage_type: str, coverage_amount: u256, deductible: u256, start_ts: str, end_ts: str):
         sender = gl.message.sender_address
         self.policy_count += 1
         policy_id = str(self.policy_count)
@@ -120,8 +116,8 @@ Respond ONLY in this JSON format:
             claim_id=claim_id, policy_id=policy_id, holder=sender.as_hex,
             incident_date=incident_date, incident_description=description,
             evidence_urls=evidence_urls_json, status="PENDING",
-            decision="", payout=0, ai_reasoning="", fraud_flags="[]",
-            timestamp=str(gl.message.timestamp),
+            decision="", coverage_pct=0, payout=0, fraud_detected=False,
+            ai_reasoning="", timestamp=str(gl.message.timestamp),
         )
         self.claims[claim_id] = json.dumps(claim.__dict__)
 
@@ -141,20 +137,36 @@ Respond ONLY in this JSON format:
         self.claims[claim_id] = json.dumps(claim)
 
         result = self._adjudicate_claim(
-            policy["coverage_type"], policy["coverage_amount"],
-            policy["deductible"], claim["incident_date"],
+            policy["coverage_type"], claim["incident_date"],
             claim["incident_description"], claim["evidence_urls"],
         )
 
+        decision = result.get("decision", "DENY")
+        pct = result.get("coverage_percentage", 0)
+        fraud = bool(result.get("fraud_detected", False))
+
+        if decision not in ("APPROVE", "DENY", "PARTIAL"):
+            decision = "DENY"
+            pct = 0
+        if pct < 0: pct = 0
+        if pct > 100: pct = 100
+        if decision == "DENY": pct = 0
+
+        coverage = policy["coverage_amount"]
+        gross = coverage * pct // 100
+        deductible = policy["deductible"]
+        payout = max(0, gross - deductible) if gross > deductible else 0
+
         claim["status"] = "RESOLVED"
-        claim["decision"] = result["decision"]
-        claim["payout"] = max(0, result["payout"] - policy["deductible"])
-        claim["ai_reasoning"] = result["reasoning"]
-        claim["fraud_flags"] = json.dumps(result["fraud_flags"])
+        claim["decision"] = decision
+        claim["coverage_pct"] = pct
+        claim["payout"] = payout
+        claim["fraud_detected"] = fraud
+        claim["ai_reasoning"] = result.get("reasoning", "")
         self.claims[claim_id] = json.dumps(claim)
 
-        if result["fraud_flags"]:
-            self.fraudsters[claim["holder"]] = json.dumps(result["fraud_flags"])
+        if fraud:
+            self.fraudsters[claim["holder"]] = json.dumps(result.get("reasoning", ""))
 
     @gl.public.view
     def get_claim(self, claim_id: str) -> str:
@@ -172,6 +184,7 @@ Respond ONLY in this JSON format:
     def get_stats(self) -> dict:
         approved = denied = partial = pending = 0
         total_payout = 0
+        fraud_count = 0
         for v in self.claims.values():
             c = json.loads(v)
             if c["status"] == "PENDING": pending += 1
@@ -180,11 +193,10 @@ Respond ONLY in this JSON format:
                 elif c["decision"] == "DENY": denied += 1
                 elif c["decision"] == "PARTIAL": partial += 1
                 total_payout += c["payout"]
+                if c["fraud_detected"]: fraud_count += 1
         return {
-            "policies": len(self.policies),
-            "claims": len(self.claims),
-            "pending": pending, "approved": approved,
-            "denied": denied, "partial": partial,
-            "total_payout": total_payout,
-            "fraudsters": len(self.fraudsters),
+            "policies": len(self.policies), "claims": len(self.claims),
+            "pending": pending, "approved": approved, "denied": denied,
+            "partial": partial, "total_payout": total_payout,
+            "fraud_detected": fraud_count, "fraudsters": len(self.fraudsters),
         }
